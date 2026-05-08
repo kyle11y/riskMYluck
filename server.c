@@ -1,10 +1,3 @@
-/*
- * Packet Salvage - TCP socket game server
- *
- * Based on the Lab Exercise 10 client/server socket flow:
- * socket() -> bind() -> listen() -> accept() -> send()/recv()
- */
-
 #include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -13,10 +6,9 @@
 #include <time.h>
 
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
-#include <ws2tcpip.h>
 typedef SOCKET socket_t;
+typedef int socklen_compat_t;
 #define CLOSE_SOCKET closesocket
 #else
 #include <arpa/inet.h>
@@ -25,453 +17,670 @@ typedef SOCKET socket_t;
 #include <sys/types.h>
 #include <unistd.h>
 typedef int socket_t;
-#define INVALID_SOCKET (-1)
-#define SOCKET_ERROR (-1)
+typedef socklen_t socklen_compat_t;
+#define INVALID_SOCKET -1
+#define SOCKET_ERROR -1
 #define CLOSE_SOCKET close
 #endif
 
-#define BUFFER_SIZE 256
-#define NODE_COUNT 5
-#define TARGET_REPAIRS 5
+#define BUFFER_SIZE 4096
+#define STARTING_HP 100
+#define MAX_HP 100
+#define MAX_ROUNDS 10
+#define CARD_PULLS 10
+
+#define GREEN_HEAL 5
+#define RED_DAMAGE 5
+#define BLACK_DAMAGE 10
+#define GOLD_HEAL 20
+#define SKULL_DAMAGE 20
+
+#define SEPARATOR "=============================="
+#define RESET "\033[0m"
+#define GRAY "\033[90m"
+#define GREEN "\033[32m"
+#define YELLOW "\033[33m"
+#define RED "\033[31m"
+#define BLACK "\033[1;30m"
+#define GOLD "\033[93m"
+#define PURPLE "\033[35m"
+
+typedef enum {
+    CARD_GRAY,
+    CARD_GREEN,
+    CARD_RED,
+    CARD_BLACK,
+    CARD_GOLD,
+    CARD_SKULL
+} CardType;
 
 typedef struct {
-    const char *name;
-    int health;
-    int fault;
-} Node;
+    int gray;
+    int green;
+    int red;
+    int black;
+    int gold;
+    int skull;
+} Stats;
 
-static void die_with_error(const char *error_msg) {
-    printf("%s\n", error_msg);
-    exit(1);
-}
-
-static void network_startup(void) {
-#ifdef _WIN32
-    WSADATA wsa_data;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa_data) != 0) {
-        die_with_error("Error: WSAStartup() Failed.");
-    }
-#endif
-}
-
-static void network_cleanup(void) {
-#ifdef _WIN32
-    WSACleanup();
-#endif
-}
-
-static int send_all(socket_t sock, const char *message) {
+int send_text(socket_t sock, const char *text) {
     size_t sent_total = 0;
-    size_t length = strlen(message);
+    size_t length = strlen(text);
+
 
     while (sent_total < length) {
-        int sent = send(sock, message + sent_total, (int)(length - sent_total), 0);
+        int sent = send(sock, text + sent_total, (int)(length - sent_total), 0);
+
+
         if (sent <= 0) {
-            return -1;
+            return 0;
         }
+
         sent_total += (size_t)sent;
     }
 
-    return 0;
+    return 1;
 }
 
-static int send_line(socket_t sock, const char *message) {
-    if (send_all(sock, message) < 0) {
-        return -1;
-    }
-    return send_all(sock, "\n");
-}
-
-static int send_format(socket_t sock, const char *format, ...) {
-    char message[512];
+int print_both(socket_t client_sock, const char *format, ...) {
+    char message[BUFFER_SIZE];
     va_list args;
+
 
     va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
 
-    return send_line(sock, message);
+
+    printf("%s", message);
+    fflush(stdout);
+    return send_text(client_sock, message);
 }
 
-static int recv_line(socket_t sock, char *buffer, size_t size) {
-    size_t used = 0;
-
-    while (used + 1 < size) {
-        char ch;
-        int received = recv(sock, &ch, 1, 0);
-
-        if (received <= 0) {
-            return -1;
-        }
-        if (ch == '\r') {
-            continue;
-        }
-        if (ch == '\n') {
-            break;
-        }
-
-        buffer[used++] = ch;
-    }
-
-    buffer[used] = '\0';
-    return (int)used;
+void remove_newline(char *text) {
+    text[strcspn(text, "\r\n")] = '\0';
 }
 
-static int ask_client(socket_t client_sock, const char *label, char *answer, size_t size) {
-    if (send_format(client_sock, "__PROMPT__:%s", label) < 0) {
+int receive_text(socket_t sock, char *buffer, int size) {
+    int n;
+
+
+    memset(buffer, 0, size);
+    n = recv(sock, buffer, size - 1, 0);
+
+
+    if (n <= 0) {
         return 0;
     }
-    return recv_line(client_sock, answer, size) >= 0;
-}
 
-static void clean_name(char *name) {
-    size_t write_at = 0;
-    size_t read_at = 0;
 
-    while (name[read_at] != '\0' && isspace((unsigned char)name[read_at])) {
-        read_at++;
-    }
-
-    while (name[read_at] != '\0' && write_at < 24) {
-        if (isspace((unsigned char)name[read_at])) {
-            if (write_at > 0 && name[write_at - 1] != ' ') {
-                name[write_at++] = ' ';
-            }
-        } else {
-            name[write_at++] = name[read_at];
-        }
-        read_at++;
-    }
-
-    if (write_at > 0 && name[write_at - 1] == ' ') {
-        write_at--;
-    }
-    name[write_at] = '\0';
-
-    if (name[0] == '\0') {
-        strcpy(name, "Player");
-    }
-}
-
-static int random_between(int min, int max) {
-    return min + rand() % (max - min + 1);
-}
-
-static int starts_with_ignore_case(const char *value, const char *prefix) {
-    while (*prefix != '\0') {
-        if (tolower((unsigned char)*value) != tolower((unsigned char)*prefix)) {
-            return 0;
-        }
-        value++;
-        prefix++;
-    }
+    buffer[n] = '\0';
+    remove_newline(buffer);
     return 1;
 }
 
-static Node *find_node(Node nodes[], const char *target) {
-    if (target == NULL || target[0] == '\0') {
-        return NULL;
-    }
+void ask_server_player(const char *prompt, char *answer, int size) {
+    printf("%s", prompt);
+    fflush(stdout);
 
-    if (isdigit((unsigned char)target[0])) {
-        int index = atoi(target) - 1;
-        if (index >= 0 && index < NODE_COUNT) {
-            return &nodes[index];
-        }
-    }
 
-    for (int i = 0; i < NODE_COUNT; i++) {
-        if (starts_with_ignore_case(nodes[i].name, target)) {
-            return &nodes[i];
-        }
+    if (fgets(answer, size, stdin) == NULL) {
+        answer[0] = '\0';
     }
-
-    return NULL;
+    remove_newline(answer);
 }
 
-static void split_command(char *command, char *action, size_t action_size, char **target) {
-    size_t index = 0;
+int send_client_prompt(socket_t client_sock, const char *prompt) {
+    char prompt_message[BUFFER_SIZE];
 
-    while (*command != '\0' && isspace((unsigned char)*command)) {
-        command++;
-    }
-
-    while (*command != '\0' && !isspace((unsigned char)*command) && index + 1 < action_size) {
-        action[index++] = (char)tolower((unsigned char)*command);
-        command++;
-    }
-    action[index] = '\0';
-
-    while (*command != '\0' && isspace((unsigned char)*command)) {
-        command++;
-    }
-
-    *target = command;
+    snprintf(prompt_message, sizeof(prompt_message), "__PROMPT__:%s\n", prompt);
+    return send_text(client_sock, prompt_message);
 }
 
-static void send_status(socket_t client_sock, Node nodes[], int integrity, int repairs) {
-    send_format(client_sock, "Packet integrity: %d/100 | Faults repaired: %d/%d",
-                integrity, repairs, TARGET_REPAIRS);
-    send_line(client_sock, "Nodes:");
+int ask_client_player(socket_t client_sock, const char *prompt, char *answer, int size) {
 
-    for (int i = 0; i < NODE_COUNT; i++) {
-        send_format(client_sock, "  %d. %-7s health=%3d/100 status=%s",
-                    i + 1,
-                    nodes[i].name,
-                    nodes[i].health,
-                    nodes[i].fault ? "FAULT" : "clear");
-    }
-}
-
-static void send_help(socket_t client_sock) {
-    send_line(client_sock, "Commands:");
-    send_line(client_sock, "  scan          - show node health and active faults");
-    send_line(client_sock, "  patch <node>  - repair a faulty node or improve a clear one");
-    send_line(client_sock, "  route <node>  - reinforce one node before the next fault");
-    send_line(client_sock, "  shield        - restore packet integrity");
-    send_line(client_sock, "  quit          - leave the game");
-}
-
-static void create_network_event(socket_t client_sock, Node nodes[], int *integrity) {
-    int index = random_between(0, NODE_COUNT - 1);
-    int damage = random_between(8, 18);
-    Node *node = &nodes[index];
-
-    if (node->fault) {
-        damage += 5;
-        *integrity -= random_between(4, 8);
-    }
-
-    node->fault = 1;
-    node->health -= damage;
-    if (node->health < 0) {
-        node->health = 0;
-    }
-    if (node->health == 0) {
-        *integrity -= 15;
-    }
-    if (*integrity < 0) {
-        *integrity = 0;
-    }
-
-    send_format(client_sock, "Network event: %s took %d damage and now has an active fault.",
-                node->name, damage);
-}
-
-static int process_command(socket_t client_sock,
-                           const char *player_name,
-                           Node nodes[],
-                           int *integrity,
-                           int *repairs,
-                           char *command) {
-    char action[32];
-    char *target = NULL;
-
-    split_command(command, action, sizeof(action), &target);
-
-    if (action[0] == '\0') {
-        send_line(client_sock, "Please enter a command. Type 'help' for options.");
+    if (!send_client_prompt(client_sock, prompt)) {
         return 0;
     }
 
-    if (strcmp(action, "help") == 0) {
-        send_help(client_sock);
-        return 0;
+
+    return receive_text(client_sock, answer, size);
+}
+
+const char *card_name(CardType card) {
+
+    if (card == CARD_GRAY) return "GRAY";
+    if (card == CARD_GREEN) return "GREEN";
+    if (card == CARD_RED) return "RED";
+    if (card == CARD_BLACK) return "BLACK";
+    if (card == CARD_GOLD) return "GOLD";
+    return "SKULL";
+}
+
+const char *card_color(CardType card) {
+
+    if (card == CARD_GRAY) return GRAY;
+    if (card == CARD_GREEN) return GREEN;
+    if (card == CARD_RED) return RED;
+    if (card == CARD_BLACK) return BLACK;
+    if (card == CARD_GOLD) return GOLD;
+    return PURPLE;
+}
+
+const char *hp_color(int hp) {
+
+    if (hp > 70) return GREEN;
+    if (hp >= 31) return YELLOW;
+    return RED;
+}
+
+int cap_hp(int hp) {
+
+    if (hp > MAX_HP) return MAX_HP;
+    if (hp < 0) return 0;
+    return hp;
+}
+
+void add_stat(Stats *stats, CardType card) {
+
+    if (card == CARD_GRAY) stats->gray++;
+    else if (card == CARD_GREEN) stats->green++;
+    else if (card == CARD_RED) stats->red++;
+    else if (card == CARD_BLACK) stats->black++;
+    else if (card == CARD_GOLD) stats->gold++;
+    else if (card == CARD_SKULL) stats->skull++;
+}
+
+void add_turn_stats(Stats *total, Stats turn) {
+
+    total->gray += turn.gray;
+    total->green += turn.green;
+    total->red += turn.red;
+    total->black += turn.black;
+    total->gold += turn.gold;
+    total->skull += turn.skull;
+}
+
+CardType get_random_card(int difficulty) {
+    int roll = rand() % 100;
+
+
+    if (difficulty == 1) {
+        if (roll < 35) return CARD_GRAY;
+        if (roll < 70) return CARD_GREEN;
+        if (roll < 88) return CARD_RED;
+        if (roll < 96) return CARD_BLACK;
+        if (roll < 99) return CARD_GOLD;
+        return CARD_SKULL;
     }
 
-    if (strcmp(action, "scan") == 0) {
-        send_status(client_sock, nodes, *integrity, *repairs);
-        return 0;
+
+    if (difficulty == 3) {
+        if (roll < 30) return CARD_GRAY;
+        if (roll < 45) return CARD_GREEN;
+        if (roll < 75) return CARD_RED;
+        if (roll < 92) return CARD_BLACK;
+        if (roll < 94) return CARD_GOLD;
+        return CARD_SKULL;
     }
 
-    if (strcmp(action, "quit") == 0) {
-        send_line(client_sock, "You left the mission.");
-        return -1;
-    }
 
-    if (strcmp(action, "shield") == 0) {
-        int gained = random_between(5, 10);
-        *integrity += gained;
-        if (*integrity > 100) {
-            *integrity = 100;
+    if (roll < 35) return CARD_GRAY;
+    if (roll < 60) return CARD_GREEN;
+    if (roll < 85) return CARD_RED;
+    if (roll < 95) return CARD_BLACK;
+    if (roll < 98) return CARD_GOLD;
+    return CARD_SKULL;
+}
+
+int choose_difficulty(socket_t client_sock) {
+    char input[BUFFER_SIZE];
+    int choice = 0;
+
+
+    send_text(client_sock, "\nWaiting for Player 1 to choose difficulty...\n");
+
+
+    while (choice < 1 || choice > 3) {
+
+        printf("\n%s\n", SEPARATOR);
+        printf("DIFFICULTY MODE\n");
+        printf("1. Easy\n");
+        printf("2. Normal\n");
+        printf("3. Hard\n");
+        printf("Choose difficulty: ");
+        fflush(stdout);
+
+        fgets(input, sizeof(input), stdin);
+        choice = atoi(input);
+
+
+        if (choice < 1 || choice > 3) {
+
+            printf("Please enter 1, 2, or 3.\n");
         }
-        send_format(client_sock, "%s boosted packet integrity by %d.", player_name, gained);
-        return 1;
     }
 
-    if (strcmp(action, "patch") == 0 || strcmp(action, "route") == 0) {
-        Node *node = find_node(nodes, target);
+    return choice;
+}
 
-        if (node == NULL) {
-            send_line(client_sock, "Unknown node. Use 'scan' to see valid node names and numbers.");
+const char *difficulty_name(int difficulty) {
+
+    if (difficulty == 1) return "Easy";
+    if (difficulty == 3) return "Hard";
+    return "Normal";
+}
+
+void show_hp(socket_t client_sock, const char *p1_name, int p1_hp, const char *p2_name, int p2_hp) {
+
+    print_both(client_sock,
+               "%s HP: %s%d%s\n"
+               "%s HP: %s%d%s\n",
+               p1_name, hp_color(p1_hp), p1_hp, RESET,
+               p2_name, hp_color(p2_hp), p2_hp, RESET);
+}
+
+void show_scoreboard(socket_t client_sock, const char *p1_name, const char *p2_name, int p1_wins, int p2_wins) {
+
+    print_both(client_sock,
+               "\n%s\n"
+               "SCOREBOARD\n\n"
+               "%s Wins: %d\n"
+               "%s Wins: %d\n"
+               "%s\n",
+               SEPARATOR, p1_name, p1_wins, p2_name, p2_wins, SEPARATOR);
+}
+
+void show_stats(socket_t client_sock, const char *name, Stats stats) {
+
+    print_both(client_sock,
+               "\n%s pulled:\n"
+               "Gray: %d\n"
+               "Green: %d\n"
+               "Red: %d\n"
+               "Black: %d\n"
+               "Gold: %d\n"
+               "Skull: %d\n",
+               name,
+               stats.gray,
+               stats.green,
+               stats.red,
+               stats.black,
+               stats.gold,
+               stats.skull);
+}
+
+int yes_answer(const char *answer) {
+
+    while (*answer != '\0' && isspace((unsigned char)*answer)) {
+        answer++;
+    }
+
+
+    return tolower((unsigned char)*answer) == 'y';
+}
+
+int play_turn(socket_t client_sock,
+              int player,
+              int round,
+              int difficulty,
+              const char *p1_name,
+              const char *p2_name,
+              int *p1_hp,
+              int *p2_hp,
+              Stats *p1_total,
+              Stats *p2_total) {
+    char input[BUFFER_SIZE];
+    CardType cards[CARD_PULLS];
+    Stats turn_stats = {0, 0, 0, 0, 0, 0};
+    const char *current_name = (player == 1) ? p1_name : p2_name;
+    const char *enemy_name = (player == 1) ? p2_name : p1_name;
+    int *current_hp = (player == 1) ? p1_hp : p2_hp;
+    int *enemy_hp = (player == 1) ? p2_hp : p1_hp;
+    int heal;
+    int self_damage;
+    int enemy_damage;
+
+
+
+    print_both(client_sock,
+               "\n%s\n"
+               "ROUND %d/%d\n"
+               "%s\n"
+               "%s's turn\n",
+               SEPARATOR, round, MAX_ROUNDS, SEPARATOR, current_name);
+    show_hp(client_sock, p1_name, *p1_hp, p2_name, *p2_hp);
+
+
+    if (player == 1) {
+
+        send_text(client_sock, "\nWaiting for Player 1 to pull cards...\n");
+
+
+        ask_server_player("\nPress ENTER to pull 10 luckies: ", input, sizeof(input));
+    } else {
+
+        printf("\nWaiting for Player 2 to pull cards...\n");
+        fflush(stdout);
+
+
+        if (!ask_client_player(client_sock, "Press ENTER to pull 10 luckies: ", input, sizeof(input))) {
             return 0;
         }
-
-        if (strcmp(action, "patch") == 0) {
-            if (node->fault) {
-                int restored = random_between(22, 32);
-                node->fault = 0;
-                node->health += restored;
-                if (node->health > 100) {
-                    node->health = 100;
-                }
-                (*repairs)++;
-                *integrity += 3;
-                if (*integrity > 100) {
-                    *integrity = 100;
-                }
-                send_format(client_sock, "%s patched %s. Fault repaired (%d/%d).",
-                            player_name, node->name, *repairs, TARGET_REPAIRS);
-            } else {
-                int restored = random_between(10, 18);
-                node->health += restored;
-                if (node->health > 100) {
-                    node->health = 100;
-                }
-                send_format(client_sock, "%s tuned %s, restoring %d health.",
-                            player_name, node->name, restored);
-            }
-            return 1;
-        }
-
-        if (strcmp(action, "route") == 0) {
-            int reinforced = random_between(15, 24);
-            node->health += reinforced;
-            if (node->health > 100) {
-                node->health = 100;
-            }
-            send_format(client_sock, "%s rerouted traffic through %s, adding %d health.",
-                        player_name, node->name, reinforced);
-            return 1;
-        }
     }
 
-    send_line(client_sock, "Unknown command. Type 'help' for options.");
-    return 0;
+
+    print_both(client_sock, "\nPulled cards:\n");
+
+
+    for (int i = 0; i < CARD_PULLS; i++) {
+        cards[i] = get_random_card(difficulty);
+        add_stat(&turn_stats, cards[i]);
+
+
+        print_both(client_sock,
+                   "[%d] %s%s%s\n",
+                   i + 1,
+                   card_color(cards[i]),
+                   card_name(cards[i]),
+                   RESET);
+    }
+
+
+    if (player == 1) {
+        add_turn_stats(p1_total, turn_stats);
+    } else {
+        add_turn_stats(p2_total, turn_stats);
+    }
+
+
+    heal = (turn_stats.green * GREEN_HEAL) + (turn_stats.gold * GOLD_HEAL);
+    self_damage = (turn_stats.red * RED_DAMAGE) + (turn_stats.skull * SKULL_DAMAGE);
+    enemy_damage = turn_stats.black * BLACK_DAMAGE;
+
+
+    *current_hp = cap_hp(*current_hp + heal - self_damage);
+    *enemy_hp = cap_hp(*enemy_hp - enemy_damage);
+
+
+
+    print_both(client_sock,
+               "\n%s\n"
+               "RESULTS\n"
+               "%s\n"
+               "Gray x%d | Green x%d | Red x%d | Black x%d | Gold x%d | Skull x%d\n"
+               "+%d HP from Green/Gold\n"
+               "-%d HP from Red/Skull\n"
+               "%s takes -%d HP from Black\n\n",
+               SEPARATOR,
+               SEPARATOR,
+               turn_stats.gray,
+               turn_stats.green,
+               turn_stats.red,
+               turn_stats.black,
+               turn_stats.gold,
+               turn_stats.skull,
+               heal,
+               self_damage,
+               enemy_name,
+               enemy_damage);
+
+    show_hp(client_sock, p1_name, *p1_hp, p2_name, *p2_hp);
+    return 1;
 }
 
-static void play_game(socket_t client_sock) {
-    Node nodes[NODE_COUNT] = {
-        {"Gateway", 100, 0},
-        {"Cache", 100, 0},
-        {"Auth", 100, 0},
-        {"Relay", 100, 0},
-        {"Archive", 100, 0}
-    };
-    char player_name[BUFFER_SIZE];
-    char command[BUFFER_SIZE];
-    int integrity = 100;
-    int repairs = 0;
-    int running = 1;
+void show_game_rules(socket_t client_sock, const char *p1_name, const char *p2_name, int difficulty) {
 
-    send_line(client_sock, "Connected to Packet Salvage.");
-    send_line(client_sock, "Enter your player name.");
-    if (!ask_client(client_sock, "Player name", player_name, sizeof(player_name))) {
-        return;
-    }
-    clean_name(player_name);
-
-    send_format(client_sock, "Welcome, %s.", player_name);
-    send_line(client_sock, "Mission: repair network faults before packet integrity reaches zero.");
-    send_line(client_sock, "Type 'help' for commands.");
-
-    while (running && integrity > 0 && repairs < TARGET_REPAIRS) {
-        send_line(client_sock, "");
-        create_network_event(client_sock, nodes, &integrity);
-        send_status(client_sock, nodes, integrity, repairs);
-
-        while (running) {
-            send_line(client_sock, "");
-            send_line(client_sock, "Your command: scan | patch <node> | route <node> | shield | help | quit");
-            if (!ask_client(client_sock, "Command", command, sizeof(command))) {
-                running = 0;
-                break;
-            }
-
-            int result = process_command(client_sock, player_name, nodes, &integrity, &repairs, command);
-            if (result < 0) {
-                running = 0;
-                break;
-            }
-            if (result > 0) {
-                break;
-            }
-        }
-    }
-
-    send_line(client_sock, "");
-    if (repairs >= TARGET_REPAIRS) {
-        send_line(client_sock, "MISSION SUCCESS: enough faults were repaired and the relay is stable.");
-    } else if (integrity <= 0) {
-        send_line(client_sock, "MISSION FAILED: packet integrity dropped to zero.");
-    } else {
-        send_line(client_sock, "MISSION ENDED: client disconnected.");
-    }
-    send_line(client_sock, "__END__");
+    print_both(client_sock,
+               "\n%s\n"
+               "GAME START\n"
+               "%s\n"
+               "%s vs %s\n"
+               "Difficulty: %s\n"
+               "Max HP: %d\n"
+               "Max rounds: %d\n\n"
+               "Gray = nothing\n"
+               "Green = +5 HP\n"
+               "Red = -5 HP to yourself\n"
+               "Black = -10 HP to enemy\n"
+               "Gold = rare +20 HP\n"
+               "Skull = rare -20 HP to yourself\n",
+               SEPARATOR,
+               SEPARATOR,
+               p1_name,
+               p2_name,
+               difficulty_name(difficulty),
+               MAX_HP,
+               MAX_ROUNDS);
 }
 
 int main(int argc, char *argv[]) {
     socket_t server_sock;
     socket_t client_sock;
-    int port_no;
-    int option = 1;
     struct sockaddr_in server_addr;
     struct sockaddr_in client_addr;
+    socklen_compat_t client_size;
+    int port_no;
+    int option = 1;
+
+    char p1_name[50];
+    char p2_name[50];
+    char p1_answer[BUFFER_SIZE];
+    char p2_answer[BUFFER_SIZE];
+
+    int p1_wins = 0;
+    int p2_wins = 0;
+    int playing = 1;
+
+
 #ifdef _WIN32
-    int client_size;
-#else
-    socklen_t client_size;
+    WSADATA wsa_data;
+    WSAStartup(MAKEWORD(2, 2), &wsa_data);
 #endif
 
+
     if (argc < 2) {
+
         printf("Usage: %s port_no\n", argv[0]);
         return 1;
     }
 
-    srand((unsigned int)time(NULL));
-    network_startup();
 
-    printf("Server starting ...\n");
+    srand((unsigned int)time(NULL));
+    port_no = atoi(argv[1]);
+
+
     server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock == INVALID_SOCKET) {
-        die_with_error("Error: socket() Failed.");
+
+        printf("Error: socket() failed.\n");
+        return 1;
     }
 
+
     memset(&server_addr, 0, sizeof(server_addr));
-    port_no = atoi(argv[1]);
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
-    server_addr.sin_port = htons((unsigned short)port_no);
+    server_addr.sin_port = htons(port_no);
+
 
     setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, (char *)&option, sizeof(option));
 
+
     if (bind(server_sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) == SOCKET_ERROR) {
+
+        printf("Error: bind() failed. Try another port.\n");
         CLOSE_SOCKET(server_sock);
-        die_with_error("Error: bind() Failed.");
+        return 1;
     }
 
-    if (listen(server_sock, 5) == SOCKET_ERROR) {
-        CLOSE_SOCKET(server_sock);
-        die_with_error("Error: listen() Failed.");
-    }
 
-    printf("Server listening to port %d ...\n", port_no);
-    printf("Waiting for connection ...\n");
+    listen(server_sock, 5);
+
+
+    printf("Server listening on port %d...\n", port_no);
+    printf("Waiting for Player 2...\n");
+
 
     client_size = sizeof(client_addr);
     client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &client_size);
     if (client_sock == INVALID_SOCKET) {
+
+        printf("Error: accept() failed.\n");
         CLOSE_SOCKET(server_sock);
-        die_with_error("Error: accept() Failed.");
+        return 1;
     }
 
-    printf("Client successfully connected ...\n");
-    play_game(client_sock);
 
-    printf("Closing connection ...\n");
+    printf("Player 2 connected!\n\n");
+
+
+
+    printf("%s\nRisk vs Luck\n%s\n", SEPARATOR, SEPARATOR);
+
+
+    ask_server_player("Enter Player 1 name: ", p1_name, sizeof(p1_name));
+
+
+    send_text(client_sock, "==============================\nRisk vs Luck\n==============================\n");
+
+
+    if (!ask_client_player(client_sock, "Enter Player 2 name: ", p2_name, sizeof(p2_name))) {
+
+        printf("Player 2 disconnected.\n");
+        CLOSE_SOCKET(client_sock);
+        CLOSE_SOCKET(server_sock);
+        return 0;
+    }
+
+
+    if (strlen(p1_name) == 0) strcpy(p1_name, "Player 1");
+    if (strlen(p2_name) == 0) strcpy(p2_name, "Player 2");
+
+
+    while (playing) {
+        int p1_hp = STARTING_HP;
+        int p2_hp = STARTING_HP;
+        int round = 1;
+        int turn = 1;
+        int difficulty;
+        int connected = 1;
+        Stats p1_stats = {0, 0, 0, 0, 0, 0};
+        Stats p2_stats = {0, 0, 0, 0, 0, 0};
+
+
+        difficulty = choose_difficulty(client_sock);
+
+
+        print_both(client_sock, "\nSelected difficulty: %s\n", difficulty_name(difficulty));
+        show_game_rules(client_sock, p1_name, p2_name, difficulty);
+        show_scoreboard(client_sock, p1_name, p2_name, p1_wins, p2_wins);
+
+
+        while (p1_hp > 0 && p2_hp > 0 && round <= MAX_ROUNDS) {
+            connected = play_turn(client_sock,
+                                  turn,
+                                  round,
+                                  difficulty,
+                                  p1_name,
+                                  p2_name,
+                                  &p1_hp,
+                                  &p2_hp,
+                                  &p1_stats,
+                                  &p2_stats);
+
+
+            if (!connected) {
+
+                printf("Player 2 disconnected.\n");
+                break;
+            }
+
+
+            if (turn == 1) {
+                turn = 2;
+            } else {
+                turn = 1;
+                round++;
+            }
+        }
+
+
+        if (!connected) {
+            break;
+        }
+
+
+        print_both(client_sock, "\n%s\nFINAL WINNER\n%s\n", SEPARATOR, SEPARATOR);
+
+
+        if (p1_hp <= 0 && p2_hp <= 0) {
+
+            print_both(client_sock, "DRAW! Both players reached 0 HP.\n");
+        } else if (p1_hp <= 0) {
+
+            print_both(client_sock, "%s wins!\n", p2_name);
+            p2_wins++;
+        } else if (p2_hp <= 0) {
+
+            print_both(client_sock, "%s wins!\n", p1_name);
+            p1_wins++;
+        } else if (p1_hp > p2_hp) {
+
+            print_both(client_sock, "Maximum rounds reached. %s wins!\n", p1_name);
+            p1_wins++;
+        } else if (p2_hp > p1_hp) {
+
+            print_both(client_sock, "Maximum rounds reached. %s wins!\n", p2_name);
+            p2_wins++;
+        } else {
+
+            print_both(client_sock, "Maximum rounds reached. DRAW!\n");
+        }
+
+
+        show_hp(client_sock, p1_name, p1_hp, p2_name, p2_hp);
+
+
+        print_both(client_sock, "\n%s\nLUCK STATISTICS\n%s\n", SEPARATOR, SEPARATOR);
+        show_stats(client_sock, p1_name, p1_stats);
+        show_stats(client_sock, p2_name, p2_stats);
+        show_scoreboard(client_sock, p1_name, p2_name, p1_wins, p2_wins);
+
+
+        if (!send_client_prompt(client_sock, "Play again? (y/n): ")) {
+            break;
+        }
+
+
+        ask_server_player("\nPlay again? (y/n): ", p1_answer, sizeof(p1_answer));
+
+
+        if (!receive_text(client_sock, p2_answer, sizeof(p2_answer))) {
+            break;
+        }
+
+
+        if (yes_answer(p1_answer) && yes_answer(p2_answer)) {
+
+            print_both(client_sock, "\nBoth players chose yes. Starting again...\n");
+        } else {
+
+            print_both(client_sock, "\nReplay declined. Closing sockets safely...\n");
+            playing = 0;
+        }
+    }
+
+
+
+    printf("Closing connection...\n");
     CLOSE_SOCKET(client_sock);
     CLOSE_SOCKET(server_sock);
-    network_cleanup();
+
+
+#ifdef _WIN32
+    WSACleanup();
+#endif
 
     return 0;
 }

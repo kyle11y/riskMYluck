@@ -1,55 +1,88 @@
-# Packet Salvage
+# Risk vs Luck
 
-## Proposal Details
+Risk vs Luck is a two-player command-line socket game written in C. Player 1 runs the server, Player 2 connects with the client, and both players take turns pulling random cards that can heal, damage themselves, or damage the opponent.
 
-1. **Game Title:** Packet Salvage
-2. **Game Description:** Packet Salvage is an original cooperative command-line game where players act as a repair crew for a damaged network relay. The server controls the game state, creates random network faults, and broadcasts updates. Each client connects through TCP sockets and sends turn commands to help keep packet integrity above zero.
-3. **Game Mechanics:**
-   - Start the server, then connect one to three clients.
-   - Players take turns sending commands from their own client terminal.
-   - `scan` displays the relay nodes and their current condition.
-   - `patch <node>` repairs an active fault or restores health to a clear node.
-   - `route <node>` reinforces a node so it can survive future faults.
-   - `shield` restores packet integrity.
-   - The team wins after repairing enough faults. The team loses if packet integrity reaches zero.
-4. **Names of 3 Members:**
-   - Member 1:
-   - Member 2:
-   - Member 3:
+## Game Overview
 
-## How to Run
+- Two players connect through a TCP socket.
+- Each player starts with 100 HP.
+- Player 1 chooses the difficulty: Easy, Normal, or Hard.
+- Players take turns pulling 10 cards per turn.
+- The game lasts up to 10 rounds, or ends early when a player's HP reaches 0.
+- The winner is the player with HP remaining, or the player with higher HP after the final round.
+- The game tracks wins and card statistics across replays.
 
-Open one terminal for the server:
+## Card Effects
 
-```bash
-bash server.sh 5050
-```
+| Card | Effect |
+| --- | --- |
+| Gray | No HP change |
+| Green | Heal self by 5 HP |
+| Red | Damage self by 5 HP |
+| Black | Damage opponent by 10 HP |
+| Gold | Heal self by 20 HP |
+| Skull | Damage self by 20 HP |
 
-Open another terminal for the client:
+## Requirements
 
-```bash
-bash client.sh 127.0.0.1 5050
-```
+- GCC or another C compiler
+- Two terminals
+- A local network connection, or `localhost` when running both programs on one computer
 
-The `.sh` files compile the C files first, then run the game.
+## Compile
 
-Manual compile commands:
+On Linux, macOS, Git Bash, or MSYS2:
 
 ```bash
 gcc -Wall -Wextra -std=c11 -o server server.c
 gcc -Wall -Wextra -std=c11 -o client client.c
 ```
 
-On Windows/MSYS2 or Git Bash, add Winsock:
+On Windows with Winsock:
 
 ```bash
 gcc -Wall -Wextra -std=c11 -o server.exe server.c -lws2_32
 gcc -Wall -Wextra -std=c11 -o client.exe client.c -lws2_32
 ```
 
+## Run
+
+Open one terminal for Player 1 and start the server:
+
+```bash
+./server 5000
+```
+
+Open another terminal for Player 2 and connect the client:
+
+```bash
+./client 127.0.0.1 5000
+```
+
+On Windows, use `server.exe` and `client.exe` instead:
+
+```bash
+server.exe 5000
+client.exe 127.0.0.1 5000
+```
+
+## Controls
+
+- Player 1 enters commands directly in the server terminal.
+- Player 2 enters commands in the client terminal when prompted.
+- Press Enter after each answer.
+- Type `y` or `n` when asked to play again.
+
 ## Socket Reference
 
-This project follows the client-server socket flow from the lab exercise:
+The project uses a simple client-server TCP flow:
 
-- Server: creates a TCP socket, then uses `bind()`, `listen()`, `accept()`, `send()`, and `recv()`.
-- Client: creates a TCP socket, then uses `connect()`, `send()`, and `recv()`.
+- Server: `socket()`, `bind()`, `listen()`, `accept()`, `send()`, `recv()`
+- Client: `socket()`, `getaddrinfo()`, `connect()`, `send()`, `recv()`
+
+## Files
+
+- `server.c` - Main game state, rules, random card draws, and socket server.
+- `client.c` - Client connection and Player 2 prompt handling.
+- `server.sh` - Bash/netcat server script from an earlier prototype.
+- `client.sh` - Bash/netcat client script from an earlier prototype.

@@ -1,21 +1,18 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOST="${1:-127.0.0.1}"
-PORT="${2:-5050}"
-CLIENT_BIN="$SCRIPT_DIR/client"
-LIBS=""
+SERVER_IP="localhost"
 
-case "$(uname -s 2>/dev/null || echo unknown)" in
-  MINGW*|MSYS*|CYGWIN*)
-    CLIENT_BIN="$SCRIPT_DIR/client.exe"
-    LIBS="-lws2_32"
-    ;;
-esac
+echo "Connecting to server..."
 
-if [[ ! -x "$CLIENT_BIN" || "$SCRIPT_DIR/client.c" -nt "$CLIENT_BIN" ]]; then
-  gcc -Wall -Wextra -std=c11 -o "$CLIENT_BIN" "$SCRIPT_DIR/client.c" $LIBS
-fi
+nc $SERVER_IP 5000 | while read line; do
+    echo "$line"
+done &
+NC_PID=$!
 
-exec "$CLIENT_BIN" "$HOST" "$PORT"
+while true; do
+    read -p "Type DRAW to play: " cmd
+
+    if [ "$cmd" == "DRAW" ]; then
+        echo "DRAW" | nc $SERVER_IP 5000
+    fi
+done

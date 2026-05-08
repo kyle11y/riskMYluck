@@ -1,10 +1,3 @@
-/*
- * Packet Salvage - TCP socket game client
- *
- * Based on the Lab Exercise 10 client/server socket flow:
- * socket() -> connect() -> send()/recv()
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -91,7 +84,7 @@ static int recv_line(socket_t sock, char *buffer, size_t size) {
 static void send_user_input(socket_t sock, const char *label) {
     char input[BUFFER_SIZE];
 
-    printf("%s: ", label);
+    printf("%s", label);
     fflush(stdout);
 
     if (fgets(input, sizeof(input), stdin) == NULL) {
